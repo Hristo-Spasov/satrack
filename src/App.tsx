@@ -2,20 +2,25 @@ import {
   Viewer,
   ImageryLayer,
   CesiumComponentRef,
-  Entity,
   SkyBox,
+  Entity,
 } from "resium";
 import {
   ArcGisMapServerImageryProvider,
   Cartesian2,
   Cartesian3,
   Color,
+  HorizontalOrigin,
   Ion,
   UrlTemplateImageryProvider,
+  VerticalOrigin,
+  JulianDate,
+  SampledPositionProperty,
+  ClockRange,
 } from "cesium";
 import { Viewer as CesiumViewer } from "cesium";
 import "./App.css";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   twoline2satrec,
   propagate,
@@ -33,7 +38,6 @@ import negativeZ from "./assets/cubemap/skybox/back.png";
 import { useQuery } from "@tanstack/react-query";
 import axios, { AxiosError } from "axios";
 
-Ion.defaultAccessToken = null;
 const esri = await ArcGisMapServerImageryProvider.fromUrl(
   "https://services.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer/"
 );
@@ -41,24 +45,56 @@ const hybridImageryProvider = new UrlTemplateImageryProvider({
   url: "https://cartodb-basemaps-a.global.ssl.fastly.net/rastertiles/voyager_only_labels/{z}/{x}/{y}.png",
 });
 
-interface Satellite {
-  name: string;
-  position: {
-    longitude: number;
-    latitude: number;
-    altitude: number;
-  };
-}
 interface TleData {
   name: string;
   line1: string;
   line2: string;
 }
 
+interface SatelliteEntity {
+  name: string;
+  position: SampledPositionProperty;
+}
+
 function App() {
+  Ion.defaultAccessToken = "";
   const viewerRef = useRef<CesiumComponentRef<CesiumViewer>>(null);
-  const [satellites, setSatellites] = useState<Satellite[]>([]);
-  const [tleData, setTleData] = useState<TleData[]>([]);
+  const [fps, setFps] = useState<number>(0);
+  const [satelliteEntities, setSatelliteEntities] = useState<SatelliteEntity[]>(
+    []
+  );
+  const start = JulianDate.fromDate(new Date());
+  // const stop = JulianDate.addMinutes(start, 5, new JulianDate());
+
+  // Set up FPS calculation
+  useEffect(() => {
+    if (document.visibilityState === "hidden") return;
+    let frameCount = 0;
+    let lastFpsUpdate = performance.now();
+    let animationFrameId: number;
+
+    const calculateFps = () => {
+      const now = performance.now();
+      frameCount++;
+
+      if (now - lastFpsUpdate >= 1000) {
+        const fps = (frameCount * 1000) / (now - lastFpsUpdate);
+        setFps(Math.round(fps));
+        lastFpsUpdate = now;
+        frameCount = 0;
+      }
+
+      animationFrameId = requestAnimationFrame(calculateFps);
+    };
+
+    // Start calculating FPS
+    animationFrameId = requestAnimationFrame(calculateFps);
+
+    return () => {
+      // Cancel animation frame when component unmounts
+      cancelAnimationFrame(animationFrameId);
+    };
+  }, []);
 
   const fetchTleData = async (): Promise<TleData[]> => {
     const url =
@@ -79,53 +115,74 @@ function App() {
     }
   };
 
-  const { data: cachedTleData, status: tleDataStatus } = useQuery({
+  const { data: tleData } = useQuery({
     queryKey: ["tleData"],
-    queryFn: fetchTleData,
+    queryFn: () => fetchTleData(),
+    staleTime: 3 * 60 * 60 * 1000,
   });
 
-  useEffect(() => {
-    if (tleDataStatus === "success") setTleData(cachedTleData);
-  }, [cachedTleData, tleDataStatus]);
-
   const calculateSatellitePositions = () => {
-    const updatedSatellites: Satellite[] = tleData
-      .map(({ name, line1, line2 }) => {
+    if (!tleData) return;
+    const entities: SatelliteEntity[] = tleData.map(
+      ({ name, line1, line2 }) => {
         const satrec = twoline2satrec(line1, line2);
-        const positionAndVelocity = propagate(satrec, new Date());
-        const positionEci = positionAndVelocity.position;
+        const positionProperty = new SampledPositionProperty();
 
-        if (positionEci && typeof positionEci === "object") {
-          const gmst = gstime(new Date());
-          const positionGd = eciToGeodetic(positionEci, gmst);
-          const longitude = degreesLong(positionGd.longitude);
-          const latitude = degreesLat(positionGd.latitude);
-          const altitude = positionGd.height * 1000; // Convert km to meters
+        // Calculate positions for next 60 seconds with 1-second intervals
+        for (let i = 0; i < 4; i++) {
+          const time = JulianDate.addHours(start, i, new JulianDate());
+          const jsDate = JulianDate.toDate(time);
 
-          return {
-            name,
-            position: {
-              longitude,
-              latitude,
-              altitude,
-            },
-          };
-        } else {
-          console.error("Something is wrong with the data");
-          return null;
+          const positionAndVelocity = propagate(satrec, jsDate);
+          const positionEci = positionAndVelocity.position;
+
+          if (positionEci && typeof positionEci === "object") {
+            const gmst = gstime(jsDate);
+            const positionGd = eciToGeodetic(positionEci, gmst);
+            const position = Cartesian3.fromDegrees(
+              degreesLong(positionGd.longitude),
+              degreesLat(positionGd.latitude),
+              positionGd.height * 1000
+            );
+
+            positionProperty.addSample(time, position);
+          }
         }
-      })
-      .filter((satellite): satellite is Satellite => satellite !== null);
 
-    setSatellites(updatedSatellites);
+        return {
+          name,
+          position: positionProperty,
+        };
+      }
+    );
+
+    setSatelliteEntities(entities);
   };
 
-  // Update positions every second using the latest fetched TLE data
   useEffect(() => {
-    const positionInterval = setInterval(calculateSatellitePositions, 100); // Update every 1 second
+    if (!viewerRef.current?.cesiumElement) return;
 
-    return () => clearInterval(positionInterval); // Cleanup on unmount
-  }); // Run whenever tleData changes
+    const viewer = viewerRef.current.cesiumElement;
+    viewer.clock.startTime = start.clone();
+    viewer.clock.currentTime = start.clone();
+    viewer.clock.clockRange = ClockRange.UNBOUNDED;
+    viewer.clock.multiplier = 1;
+    viewer.clock.shouldAnimate = true;
+
+    calculateSatellitePositions();
+  }, [tleData]);
+
+  const skyboxSources = useMemo(
+    () => ({
+      positiveX: positiveX,
+      negativeX: negativeX,
+      positiveY: positiveY,
+      negativeY: negativeY,
+      positiveZ: positiveZ,
+      negativeZ: negativeZ,
+    }),
+    []
+  );
 
   return (
     <Viewer
@@ -143,29 +200,29 @@ function App() {
       infoBox={false}
       selectionIndicator={false}
       baseLayerPicker={false}
+      shouldAnimate={true} //makes the clock animate even if the tab is not open
     >
-      <SkyBox
-        sources={{
-          positiveX: positiveX,
-          negativeX: negativeX,
-          positiveY: positiveY,
-          negativeY: negativeY,
-          positiveZ: positiveZ,
-          negativeZ: negativeZ,
+      <div
+        style={{
+          position: "absolute",
+          top: 0,
+          left: 0,
+          padding: "10px",
+          backgroundColor: "rgba(0, 0, 0, 0.7)",
+          color: "white",
+          fontSize: "16px",
         }}
-      />
+      >
+        FPS: {fps}
+      </div>
+      <SkyBox sources={skyboxSources} />
 
       <ImageryLayer imageryProvider={esri} />
       <ImageryLayer imageryProvider={hybridImageryProvider} />
-      {satellites.map((satellite, index) => (
+      {satelliteEntities.map((satEntity, index) => (
         <Entity
           key={index}
-          name={satellite.name}
-          position={Cartesian3.fromDegrees(
-            satellite.position.longitude,
-            satellite.position.latitude,
-            satellite.position.altitude
-          )}
+          position={satEntity.position}
           point={{
             pixelSize: 5,
             color: Color.RED,
@@ -173,17 +230,19 @@ function App() {
             outlineWidth: 2,
           }}
           label={{
-            text: satellite.name,
-            font: "14pt sans-serif",
+            text: satEntity.name,
+            font: "32px sans-serif",
             fillColor: Color.WHITE,
             outlineColor: Color.BLACK,
-            outlineWidth: 1,
-            pixelOffset: new Cartesian2(0, -10),
+            outlineWidth: 2,
+            pixelOffset: new Cartesian2(0, 20),
+            horizontalOrigin: HorizontalOrigin.CENTER,
+            verticalOrigin: VerticalOrigin.CENTER,
+            scale: 0.5,
           }}
         />
       ))}
     </Viewer>
   );
 }
-
 export default App;
